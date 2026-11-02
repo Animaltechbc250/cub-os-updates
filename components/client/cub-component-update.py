@@ -7,6 +7,7 @@ an isolated root and ephemeral public key; the installed CLI exposes neither.
 import argparse
 import base64
 import contextlib
+import errno
 import fcntl
 import hashlib
 import io
@@ -33,6 +34,8 @@ PREFIXES = ('usr/local/lib/cub-os/', 'usr/local/share/cub-os/',
 MAX_FILE = 256 * 1024**2
 MAX_TOTAL = 512 * 1024**2
 MAX_FILES = 128
+MAX_DIRECTORIES = 256
+DIRECTORY_BASES = tuple(p.rstrip('/') for p in PREFIXES if p.endswith('/'))
 CHANNEL = 'https://raw.githubusercontent.com/Animaltechbc250/cub-os-updates/main/components/channel.json'
 
 
@@ -209,8 +212,8 @@ def manifest(raw, signature, key):
     require(len(raw) <= 128 * 1024, 'Manifest size bound')
     verify_signature(raw, signature, key)
     value = parse(raw)
-    require(type(value) is dict and set(value) ==
-            {'schema', 'product', 'id', 'title', 'notes', 'restart', 'files'}, 'Manifest fields')
+    fields = {'schema', 'product', 'id', 'title', 'notes', 'restart', 'files'}
+    require(type(value) is dict and set(value) in (fields, fields | {'directories'}), 'Manifest fields')
     require(canonical(value) == raw, 'Canonical signed manifest required')
     require(type(value['schema']) is int and value['schema'] == 1 and value['product'] == 'cub-os',
             'Wrong schema or product')
@@ -246,7 +249,27 @@ def manifest(raw, signature, key):
                     type(before['mode']) is int and before['mode'] in (0o644, 0o755), 'Before descriptor')
         total += entry['bytes']
     require(total <= MAX_TOTAL, 'Total payload size')
+    require(not any(a != b and b.startswith(a + '/') for a in seen for b in seen),
+            'A file cannot also be a parent directory')
+    dirs = value.get('directories', [])
+    require(type(dirs) is list and len(dirs) <= MAX_DIRECTORIES, 'Directory list bound')
+    declared = set()
+    for entry in dirs:
+        require(type(entry) is dict and set(entry) == {'path', 'mode'}, 'Directory descriptor fields')
+        path = entry['path']
+        require(safe_directory(path) and path not in declared and path not in seen and
+                any(f.startswith(path + '/') for f in seen), 'Unapproved or unused directory declaration')
+        require(type(entry['mode']) is int and entry['mode'] in (0o700, 0o755), 'Directory mode')
+        declared.add(path)
     return value
+
+
+def safe_directory(path):
+    return (type(path) is str and 0 < len(path) <= 240 and
+            str(PurePosixPath(path)) == path and not path.startswith('/') and '\\' not in path and
+            len(path.split('/')) <= 24 and
+            all(p not in ('', '.', '..') and not p.startswith('.') for p in path.split('/')) and
+            any(path == base or path.startswith(base + '/') for base in DIRECTORY_BASES))
 
 
 def bundle(path, key, download=False, report=print):
@@ -329,22 +352,153 @@ class Engine:
     def journal(self, fd, value):
         atomic(fd, 'receipt.json', canonical(value), 0o600)
 
+    def target_state(self, entry):
+        path = self.root / entry['path']
+        try:
+            with directory(path.parent) as fd:
+                return snapshot(fd, path.name)
+        except FileNotFoundError:
+            return None, None
+
+    def preflight(self, value):
+        """Read-only plan. Signed file parents imply 0755 for legacy bundles.
+
+        Explicit signed directory descriptors may request 0700 or 0755. Only
+        directories inside the fixed component bases can ever be created.
+        Missing installation ancestors outside those bases are an incompatibility.
+        """
+        modes = {e['path']: e['mode'] for e in value.get('directories', [])}
+        missing, existing = {}, {}
+        for entry in value['files']:
+            parts = PurePosixPath(entry['path']).parent.parts
+            with directory(self.root) as root:
+                fd = os.dup(root)
+                absent = False
+                try:
+                    for index, name in enumerate(parts):
+                        relative = '/'.join(parts[:index + 1])
+                        if not absent:
+                            try:
+                                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                                dir_fd=fd)
+                            except FileNotFoundError:
+                                absent = True
+                            except OSError as error:
+                                raise ValueError('Cannot use directory ' + str(self.root / relative) + ': ' + error.strerror) from error
+                            else:
+                                try:
+                                    info = os.fstat(child)
+                                    trusted(info)
+                                    require(info.st_dev == os.fstat(fd).st_dev, 'Nested filesystem refused')
+                                    if relative in modes:
+                                        require(stat.S_IMODE(info.st_mode) == modes[relative],
+                                                'Existing directory mode differs: ' + relative)
+                                    existing[relative] = [info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)]
+                                except BaseException:
+                                    os.close(child)
+                                    raise
+                                os.close(fd)
+                                fd = child
+                        if absent:
+                            require(safe_directory(relative), 'Missing installation directory outside update scope: ' + relative)
+                            missing[relative] = modes.get(relative, 0o755)
+                finally:
+                    os.close(fd)
+        require(len(missing) <= MAX_DIRECTORIES, 'Too many new directories')
+        before_bytes = 0
+        for entry in value['files']:
+            current, data = self.target_state(entry)
+            require(current == entry['before'], 'Installed file differs: ' + entry['path'])
+            before_bytes += len(data) if data is not None else 0
+        return {'directories': [{'path': p, 'mode': missing[p]} for p in sorted(missing, key=lambda p: (len(p.split('/')), p))],
+                'existing': existing, 'backup_bytes': before_bytes}
+
+    def create_directories(self, tx, record, plan):
+        for entry in plan['directories']:
+            path = self.root / entry['path']
+            # Persist intent before mkdir. A crash before inode recording keeps
+            # the unproven directory for inspection; rollback never guesses ownership.
+            saved = {'path': entry['path'], 'mode': entry['mode'], 'identity': None}
+            record['created_directories'].append(saved)
+            self.journal(tx, record)
+            with directory(path.parent) as fd:
+                os.mkdir(path.name, entry['mode'], dir_fd=fd)
+                os.fsync(fd)
+            with directory(path) as fd:
+                os.fchmod(fd, entry['mode'])
+                os.fsync(fd)
+                info = os.fstat(fd)
+                require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == entry['mode'], 'New directory metadata')
+                saved['identity'] = [info.st_dev, info.st_ino]
+            self.journal(tx, record)
+            self.report('Created directory ' + entry['path'])
+
+    def validate_created_directories(self, record, value):
+        created = record.get('created_directories', [])
+        require(type(created) is list and len(created) <= MAX_DIRECTORIES, 'Retained directory list')
+        seen = set()
+        for item in created:
+            require(type(item) is dict and set(item) == {'path', 'mode', 'identity'} and
+                    safe_directory(item['path']) and item['path'] not in seen and
+                    any(e['path'].startswith(item['path'] + '/') for e in value['files']) and
+                    type(item['mode']) is int and item['mode'] in (0o700, 0o755), 'Retained directory descriptor')
+            seen.add(item['path'])
+            identity = item['identity']
+            require(identity is None or (type(identity) is list and len(identity) == 2 and
+                    all(type(n) is int and n >= 0 for n in identity)), 'Directory identity')
+            if identity is not None:
+                try:
+                    with directory(self.root / item['path']) as fd:
+                        info = os.fstat(fd)
+                        require([info.st_dev, info.st_ino] == identity and
+                                stat.S_IMODE(info.st_mode) == item['mode'], 'Created directory changed; rollback held')
+                except FileNotFoundError:
+                    pass
+        return created
+
+    def remove_created_directories(self, created):
+        retained = []
+        for item in sorted(created, key=lambda e: len(e['path'].split('/')), reverse=True):
+            path = self.root / item['path']
+            try:
+                with directory(path) as fd:
+                    info = os.fstat(fd)
+                    if item['identity'] is None:
+                        retained.append(item['path'])
+                        continue
+                    require([info.st_dev, info.st_ino] == item['identity'], 'Directory changed during rollback')
+                with directory(path.parent) as fd:
+                    try:
+                        os.rmdir(path.name, dir_fd=fd)
+                    except OSError as error:
+                        if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                            raise
+                        retained.append(item['path'])
+                    os.fsync(fd)
+            except FileNotFoundError:
+                pass
+        for path in retained:
+            self.report('Retained nonempty or unproven directory ' + path)
+        return retained
+
     def apply(self, package, approval):
         value, raw, signature, blobs = bundle(package, self.key)
         require(approval == sha(raw), 'Inspect the update notes and supply their exact approval hash')
-        with self.locked() as store, self.targets(value['files']) as targets:
+        with self.locked() as store:
             try:
                 os.stat(value['id'], dir_fd=store, follow_symlinks=False)
             except FileNotFoundError:
                 pass
             else:
                 raise ValueError('This update ID has a retained transaction; inspect it before another attempt')
-            for e, fd, name in targets:
-                require(snapshot(fd, name)[0] == e['before'], 'Installed file differs: ' + e['path'])
+            plan = self.preflight(value)
+            required = 2 * sum(e['bytes'] for e in value['files']) + plan['backup_bytes'] + 64 * 1024**2
+            fs = os.fstatvfs(store)
+            require(fs.f_bavail * fs.f_frsize >= required, 'Insufficient free space')
             # Fetch only authenticated descriptors, after installed-baseline checks.
             _, checked_raw, _, blobs = bundle(package, self.key, download=True, report=self.report)
             require(checked_raw == raw, 'Bundle changed during preparation')
-            required = 2 * sum(e['bytes'] for e in value['files']) + 64 * 1024**2
+            require(self.preflight(value) == plan, 'Installation paths changed during preparation')
             fs = os.fstatvfs(store)
             require(fs.f_bavail * fs.f_frsize >= required, 'Insufficient free space')
             # No replacement/reuse of retained transaction IDs, including failed ones.
@@ -354,24 +508,31 @@ class Engine:
                 atomic(tx, 'manifest.json', raw, 0o600)
                 atomic(tx, 'manifest.sig', signature, 0o600)
                 record = {'schema': 1, 'id': value['id'], 'manifest_sha256': sha(raw),
-                          'phase': 'backing-up', 'installed_count': 0, 'time': int(time.time())}
+                          'phase': 'backing-up', 'installed_count': 0, 'time': int(time.time()),
+                          'created_directories': []}
                 self.journal(tx, record)
                 try:
-                    for i, (e, fd, name) in enumerate(targets):
-                        before, data = snapshot(fd, name)
+                    for i, e in enumerate(value['files']):
+                        before, data = self.target_state(e)
                         require(before == e['before'], 'File changed before backup')
                         if data is not None:
                             atomic(tx, 'backup-' + str(i), data, 0o600)
-                    record['phase'] = 'installing'
+                    record['phase'] = 'preparing-directories'
                     self.journal(tx, record)
-                    for i, (e, fd, name) in enumerate(targets):
-                        require(snapshot(fd, name)[0] == e['before'], 'File changed before replacement')
-                        self.report('Installing ' + e['path'])
-                        atomic(fd, name, blobs[e['sha256']], e['mode'])
-                        require(snapshot(fd, name)[0] == {'sha256': e['sha256'], 'mode': e['mode']},
-                                'Written file verification failed')
-                        record['installed_count'] = i + 1
+                    self.create_directories(tx, record, plan)
+                    with self.targets(value['files']) as targets:
+                        for e, fd, name in targets:
+                            require(snapshot(fd, name)[0] == e['before'], 'File changed before replacement')
+                        record['phase'] = 'installing'
                         self.journal(tx, record)
+                        for i, (e, fd, name) in enumerate(targets):
+                            require(snapshot(fd, name)[0] == e['before'], 'File changed before replacement')
+                            self.report('Installing ' + e['path'])
+                            atomic(fd, name, blobs[e['sha256']], e['mode'])
+                            require(snapshot(fd, name)[0] == {'sha256': e['sha256'], 'mode': e['mode']},
+                                    'Written file verification failed')
+                            record['installed_count'] = i + 1
+                            self.journal(tx, record)
                     record['phase'] = 'installed'
                     self.journal(tx, record)
                 except BaseException:
@@ -391,24 +552,31 @@ class Engine:
             require(value['id'] == update_id, 'Transaction identity')
             record = parse(read_at(tx, 'receipt.json', 65536)[0])
             require(record['manifest_sha256'] == sha(raw) and record['id'] == update_id and
-                    record['phase'] in ('installing', 'installed', 'failed-retained', 'rolling-back'),
+                    record['phase'] in ('backing-up', 'preparing-directories', 'installing', 'installed', 'failed-retained', 'rolling-back'),
                     'Transaction cannot be rolled back')
-            with self.targets(value['files']) as targets:
+            created = self.validate_created_directories(record, value)
+            with contextlib.ExitStack() as stack:
                 restore = []
                 # Validate ALL current files and ALL backups before changing anything.
-                for i, (e, fd, name) in enumerate(targets):
-                    current = snapshot(fd, name)[0]
+                for i, e in enumerate(value['files']):
+                    path = self.root / e['path']
+                    try:
+                        fd = stack.enter_context(directory(path.parent))
+                    except FileNotFoundError:
+                        fd = None
+                    name = path.name
+                    current = snapshot(fd, name)[0] if fd is not None else None
                     after = {'sha256': e['sha256'], 'mode': e['mode']}
                     require(current in (e['before'], after), 'Locally changed file; rollback held: ' + e['path'])
                     data = None
-                    if e['before'] is not None:
+                    if e['before'] is not None and current != e['before']:
                         data = read_at(tx, 'backup-' + str(i))[0]
                         require(sha(data) == e['before']['sha256'], 'Corrupt rollback copy')
                     restore.append((e, fd, name, current, data))
                 record['phase'] = 'rolling-back'
                 self.journal(tx, record)
                 for e, fd, name, current, data in reversed(restore):
-                    require(snapshot(fd, name)[0] == current, 'File changed during rollback')
+                    require((snapshot(fd, name)[0] if fd is not None else None) == current, 'File changed during rollback')
                     if current == e['before']:
                         continue
                     self.report('Restoring ' + e['path'])
@@ -418,6 +586,7 @@ class Engine:
                     else:
                         atomic(fd, name, data, e['before']['mode'])
                     require(snapshot(fd, name)[0] == e['before'], 'Restored file verification failed')
+                record['retained_directories'] = self.remove_created_directories(created)
                 record['phase'] = 'rolled-back'
                 self.journal(tx, record)
         self.report('Rolled back ' + update_id + '.')
@@ -452,9 +621,20 @@ def main():
                     installed = installed and actual == {'sha256': entry['sha256'], 'mode': entry['mode']}
                 except FileNotFoundError:
                     installed = False
+            can_install, message, new_dirs = True, '', []
+            if not installed:
+                try:
+                    plan = Engine('/', STORE, key).preflight(value)
+                    fs = os.statvfs('/')
+                    needed = 2 * sum(e['bytes'] for e in value['files']) + plan['backup_bytes'] + 64 * 1024**2
+                    require(fs.f_bavail * fs.f_frsize >= needed, 'Insufficient free space')
+                    new_dirs = plan['directories']
+                except (OSError, ValueError) as error:
+                    can_install, message = False, str(error)
             print(json.dumps({'id': value['id'], 'title': value['title'], 'notes': value['notes'],
                 'restart': value['restart'], 'approval': sha(raw),
                 'installed': installed,
+                'can_install': can_install, 'preflight_message': message, 'create_directories': new_dirs,
                 'bytes': sum(e['bytes'] for e in value['files'])}), flush=True)
         return
     if args.action == 'inspect':
@@ -481,7 +661,7 @@ def main():
                 if re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,63}', name) and name != 'worker.lock':
                     with directory(STORE / name) as tx:
                         value = parse(read_at(tx, 'receipt.json', 65536)[0])
-                        if value['phase'] in ('installed', 'installing', 'failed-retained', 'rolling-back'):
+                        if value['phase'] in ('backing-up', 'preparing-directories', 'installed', 'installing', 'failed-retained', 'rolling-back'):
                             candidates.append((value['time'], name))
         require(bool(candidates), 'No retained component update to roll back')
         engine.rollback(max(candidates)[1])

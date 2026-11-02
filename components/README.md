@@ -18,18 +18,27 @@ The client verifies the installation's pinned Ed25519 publisher key. Packages
 declare exact file paths, starting hashes, new hashes, sizes and modes. It
 refuses unapproved paths, unexpected installed files and invalid signatures.
 Packages cannot supply arbitrary post-install commands. Starting files are
-backed up before replacement and retained for rollback.
+backed up before replacement and retained for rollback. The corrected client
+plans missing folders from signed file paths and optional signed directory
+declarations. It creates them only inside reviewed component areas, with 0700 or
+0755 permissions, after checking signatures, starting files, space and downloads.
+Check displays the planned folders before Install is enabled.
 
 Select **Roll back last update** to restore the previous component files.
 Locally edited files or corrupt backups are held for inspection instead of
-being overwritten. A rolled-back package ID is retained; reinstalling that
+being overwritten. Rollback also removes its own unchanged empty folders;
+pre-existing or nonempty folders are preserved. A rolled-back package ID is retained; reinstalling that
 change requires a new publisher-issued package ID. This is file rollback, not
 a guarantee against every hardware failure or loss of power.
 
-## First trial: HelixSR 3.2.0
+## Current trial: HelixSR 3.2.0 and automatic folders
 
 This optional prerelease trial installs the complete official HelixSR 3.2.0 ZIP,
-a desktop-user setup launcher and explanatory notes. The archive downloads
+a desktop-user setup launcher, explanatory notes and an update-details file in
+new version-specific folders. This package targets installations where these
+four files are absent and requires the corrected component client. A machine
+that already installed the earlier three-file trial is a different baseline;
+the client holds that mismatch rather than overwriting it. The archive downloads
 directly from the author's GitHub release and is checked against its pinned
 size and SHA256. It includes prebuilt HLX FSR4 shaders based on AMD's FSR SDK
 2.4.0 / FSR 4.1.2. No performance improvement or game compatibility is claimed
@@ -40,18 +49,17 @@ this package. After installation, reopen Control Center and use **FSR & Proton
 → Open HelixSR setup** only for a game you choose. Do not stack another injector
 over an existing Decky/Proton setup. Game modifications made through the separate
 official setup require its own uninstall/backup; Cub component rollback only
-removes the files added by this package.
+removes the files and empty folders added by this package.
 
 No kernel, Mesa, firmware, VCN or hardware-setting changes are part of this
 trial. Checking for updates does not need administrator authentication;
 installation uses the trusted client's narrow authorization policy.
 
 The client has passed native Linux signature, install, rollback, corruption,
-path, lock and interrupted-process tests, a real signed-payload HTTPS download
-and rollback fixture, and Qt notes/button checks. User acceptance of the actual
+path, lock and interrupted-process tests (43 cases), a real signed-payload HTTPS download
+and rollback fixture with absent folders, and Qt notes/button checks. User acceptance of the actual
 Control Center installation and per-game setup remains separate.
 
 Upstream release: https://github.com/lonewolf0622/HelixSR/releases/tag/v3.2.0
 
 Private signing keys and machine data are not part of this repository.
-

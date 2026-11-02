@@ -1,0 +1,2 @@
+#!/usr/bin/bash
+exec /usr/bin/timeout --signal=TERM --kill-after=5s 600s /usr/bin/python3 -I -B /usr/local/lib/cub-os/component_update.py "$@"

@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "required_bootstrap_directories": [
+    {"path": "/var/lib/cub-os/component-updates", "owner": "root", "mode": "0700"}
+  ],
+  "managed_component_bases": ["usr/local/lib/cub-os", "usr/local/share/cub-os", "usr/share/steam/compatibilitytools.d/proton-cachyos-slr-bc250", "etc/NetworkManager/conf.d", "etc/gamescope-session-plus/sessions.d"],
+  "directory_modes": ["0700", "0755"],
+  "legacy_directory_default": "0755",
+  "rule": "Provision the trusted transaction store during bootstrap/ISO installation. Missing payload parents inside reviewed component bases are planned from signed file paths and created during installation; optional signed directory declarations select permissions. Reject missing system ancestors outside these bases. Rollback removes only recorded, unchanged, empty directories."
+}

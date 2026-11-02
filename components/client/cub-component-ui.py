@@ -88,11 +88,13 @@ class Window(QWidget):
                 raise ValueError(text or 'Update command failed. No success was reported.')
             if self.action == 'online-check':
                 value = json.loads(text)
-                self.approval = None if value.get('installed') else value['approval']
+                self.approval = None if value.get('installed') or not value.get('can_install', True) else value['approval']
                 self.notes.setPlainText(value['title'] + '\n\n' + value['notes'] +
-                    '\n\nRestart: ' + value['restart'] + '\nDownload: ' + str(round(value['bytes']/1024**2, 1)) + ' MiB')
+                    '\n\nRestart: ' + value['restart'] + '\nDownload: ' + str(round(value['bytes']/1024**2, 1)) + ' MiB' +
+                    ('\n\nFolders this update will create automatically:\n' + '\n'.join('/' + e['path'] + ' (' + format(e['mode'], '04o') + ')' for e in value.get('create_directories', [])) if value.get('create_directories') else ''))
                 self.status.setText('This component update is already installed and its files match.' if value.get('installed') else
-                                    'Signed update available. Read the notes, then select Install update.')
+                                    ('Update cannot be applied: ' + value.get('preflight_message', 'Preflight failed.')) if not value.get('can_install', True) else
+                                    'Signed update available. Preflight passed; read the notes, then select Install update.')
             elif self.action == 'online-apply':
                 self.status.setText('Update installed and verified. Previous files are retained for rollback.')
                 self.approval = None
